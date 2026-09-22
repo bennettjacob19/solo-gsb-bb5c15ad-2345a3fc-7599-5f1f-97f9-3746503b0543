@@ -520,6 +520,38 @@ def plan_release(req: PlanCreate, settings: Settings) -> tuple[PlanOutput, list[
     raise RuntimeError("Unexpected solver infeasibility without a wave window cap")
 
 
+def schedule_minimum_waves(
+    services: list[str],
+    edges: list[tuple[str, str]],
+    fault_cliques: list[list[str]],
+    concurrency: int,
+    settings: Settings,
+) -> PlanOutput:
+    """Minimum-wave schedule under generic "a strictly after b" edges.
+
+    Used by rollback planning, which feeds the dependency edges in reverse:
+    a prerequisite must be rolled back in a strictly later wave than every
+    live downstream. ``services`` must already be validated and the edge
+    graph acyclic; without a wave-window cap the model is always feasible
+    (waves of one service each), so infeasibility here is a programming
+    error. Canonicalization and sorted wave members make the result
+    deterministic for identical inputs.
+    """
+    result = _solve(
+        services,
+        edges,
+        fault_cliques,
+        len(services),
+        concurrency,
+        settings,
+    )
+    if not result.feasible:
+        raise RuntimeError(
+            "Unexpected solver infeasibility without a wave window cap"
+        )
+    return _to_output(result)
+
+
 # ---------------------------------------------------------------------------
 # What-if simulation
 # ---------------------------------------------------------------------------

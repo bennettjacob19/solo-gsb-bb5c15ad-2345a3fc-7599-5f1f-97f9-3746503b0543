@@ -114,6 +114,31 @@ class PlanSimulate(BaseModel):
         return cleaned
 
 
+class RollbackPreviewRequest(BaseModel):
+    """Live services reported for a rollback preview.
+
+    ``live_services`` lists the services currently live. Rollback waves are
+    generated only for those services, in reverse dependency order
+    (downstream first), under the stored plan's per-wave concurrency cap and
+    fault-domain anti-affinity. The set must be closed under the stored
+    dependencies — otherwise the response is a localizable 422. The stored
+    plan itself is never modified.
+    """
+
+    live_services: list[str] = Field(
+        ...,
+        description="Services currently live; rollback waves cover exactly these",
+    )
+
+    @field_validator("live_services")
+    @classmethod
+    def _strip_service_ids(cls, values: list[str]) -> list[str]:
+        cleaned = [s.strip() for s in values]
+        if any(not s for s in cleaned):
+            raise ValueError("service id must not be blank")
+        return cleaned
+
+
 class GateRequest(BaseModel):
     """Execution progress reported against a stored plan.
 
@@ -272,6 +297,29 @@ class GateResult(BaseModel):
     failed_services: list[str] = Field(..., description="Reported failures, sorted")
     waves: list[GateWaveStatus] = Field(
         ..., description="Executable/blocked/completed/failed split for every stored wave"
+    )
+
+
+class RollbackPreviewResult(BaseModel):
+    """Minimum-wave rollback schedule for the reported live set; never persisted."""
+
+    plan_id: int
+    name: str | None
+    live_services: list[str] = Field(
+        ..., description="Validated, de-duplicated live set the waves cover, sorted"
+    )
+    waves: list[Wave] = Field(
+        ...,
+        description="Rollback waves; wave 1 is rolled back first and contains "
+        "the (most downstream) live services nothing live depends on",
+    )
+    wave_count: int = Field(..., description="Number of rollback waves (0 for an empty live set)")
+    max_concurrency: int = Field(
+        ..., description="Stored plan's per-wave cap, still applied to rollback waves"
+    )
+    optimal: bool = Field(
+        ...,
+        description="True when the rollback wave count is proven minimal",
     )
 
 

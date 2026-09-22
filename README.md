@@ -6,7 +6,9 @@
 的结构化原因。方案持久化到 SQLite，支持查询与删除；`POST /plans/{id}/simulate`
 可在不落库的前提下模拟约束变更对方案的影响；`POST /plans/{id}/gate` 基于已存储的
 （不可变）波次方案做发布执行门禁，上报已完成与执行失败的服务后，逐波给出可执行
-服务、阻塞服务及可定位原因。容器启动时自动安装依赖并建表。
+服务、阻塞服务及可定位原因；`POST /plans/{id}/rollback-preview` 上报当前已上线
+服务，按「下游先回滚、依赖闭包合法、并发与故障域约束不变」预览**波次最少**的
+回滚方案。容器启动时自动安装依赖并建表。
 
 ## 一条命令启动
 
@@ -257,6 +259,89 @@ curl -X POST http://localhost:8000/plans/1/gate \
 
 门禁为只读操作，不写库：重复请求得到相同结果（确定性），方案不存在时返回 404。
 
+## 回滚预览（POST /plans/{id}/rollback-preview）
+
+回滚前上报当前**已上线**的服务集合，接口只为这些服务生成回滚波次（**只读不落库**，
+不改动已存储方案）。回滚顺序与发布相反：
+
+- 某服务必须**晚于**所有已上线且依赖它的**下游**服务回滚（下游先下线，前置后下线），
+  即在反向依赖边上做与发布相同的严格排序；
+- 继续遵守原方案的**每波并发上限**（`max_concurrency`）；
+- 继续遵守原方案的**故障域反亲和**，但只有已上线成员参与约束（未上线的同域成员
+  不额外占波）；
+- 目标仍是**波次最少**，并沿用发布规划的两阶段 CP-SAT 规范化，**相同输入永远得到
+  相同输出**，与列表内服务的书写顺序无关；波内服务按 id 排序，`optimal=true`
+  表示波次数被证明最小。
+
+```bash
+curl -X POST http://localhost:8000/plans/1/rollback-preview \
+  -H 'Content-Type: application/json' \
+  -d '{"live_services": ["db", "auth", "api", "web"]}'
+```
+
+（承接上面 `payment-platform` 示例：存储波次为 `[db] → [auth] → [api] → [cache, web]`；
+假设 `cache` 未上线，已上线集合为 `db/auth/api/web`，回滚恰好是发布顺序的镜像。）
+
+响应：
+
+```json
+{
+  "plan_id": 1,
+  "name": "payment-platform",
+  "live_services": ["api", "auth", "db", "web"],
+  "waves": [
+    {"index": 1, "services": ["web"]},
+    {"index": 2, "services": ["api"]},
+    {"index": 3, "services": ["auth"]},
+    {"index": 4, "services": ["db"]}
+  ],
+  "wave_count": 4,
+  "max_concurrency": 2,
+  "optimal": true
+}
+```
+
+`waves` 按回滚执行顺序给出（第 1 波最先回滚）；空集合合法，返回 `wave_count: 0`
+与空波次列表。
+
+**依赖闭包校验**：已上线集合必须对「depends-on」关系封闭——某服务已上线，则它依赖
+的所有前置也必须已上线。违反时返回 **422**，每个缺失前置各一条 issue，可直接定位
+到「哪个已上线服务缺了哪个前置」：
+
+```bash
+curl -X POST http://localhost:8000/plans/1/rollback-preview \
+  -H 'Content-Type: application/json' \
+  -d '{"live_services": ["api", "db"]}'
+```
+
+```json
+{
+  "error": "planning_failed",
+  "message": "The reported live set violates dependency closure.",
+  "issues": [
+    {
+      "code": "rollback_closure_violation",
+      "message": "Service 'api' is reported live, but its prerequisite 'auth' is not; ...",
+      "constraint": "live_services",
+      "service": "auth",
+      "related_services": ["api"],
+      "context": {"live_service": "api", "missing_prerequisite": "auth"}
+    }
+  ]
+}
+```
+
+| 字段 | 含义 |
+| --- | --- |
+| `live_services` | 回显校验、去重、排序后的已上线集合（波次恰好覆盖这些服务） |
+| `waves` / `wave_count` | 回滚波次（结构同创建响应，第 1 波先执行）；空集合时为 0 波 |
+| `max_concurrency` | 沿用的原方案每波并发上限 |
+| `optimal` | 回滚波次数被证明最小 |
+
+其他输入问题同样返回 422：`unknown_service`（上报了不属于本方案的服务）、
+`duplicate_service`（同一服务重复出现）；空白 id 等 JSON/Schema 问题为
+`invalid_request_field`。方案不存在返回 404。
+
 ## 错误结构（422）
 
 所有失败使用统一信封 `error + message + issues[]`，每个 issue 可定位：
@@ -289,8 +374,10 @@ curl -X POST http://localhost:8000/plans/1/gate \
 | `release_window_infeasible` | 组合约束下窗口不可行，附无窗口时所需的确切波次 |
 | `dependency_not_found` / `fault_domain_not_found` | 模拟请求要求删除不存在的依赖/故障域 |
 | `dependency_failed` / `upstream_failure` / `dependency_incomplete` | 门禁阻塞原因：直接依赖失败 / 依赖被上游失败递归阻塞（附失败根因）/ 依赖尚未完成 |
-| `unknown_service` / `duplicate_service_status` / `service_status_conflict` | 门禁上报引用未知服务、状态重复上报或完成/失败状态冲突 |
+| `unknown_service` / `duplicate_service_status` / `service_status_conflict` | 门禁上报引用未知服务、状态重复上报或完成/失败状态冲突（回滚预览的同名/同类问题见下） |
 | `completed_with_failed_dependency` / `completed_before_dependencies` | 门禁上报的「已完成」与其失败上游或未完成依赖矛盾 |
+| `rollback_closure_violation` | 回滚预览的已上线集合不满足依赖闭包（已上线服务的前置未上线），可定位到已上线服务与缺失前置 |
+| `unknown_service`（回滚预览）/ `duplicate_service` | 回滚预览上报了不属于本方案的服务或服务重复出现 |
 | `invalid_request_field` | JSON/Schema 校验失败，附带字段位置 |
 
 ## API 一览
@@ -300,6 +387,7 @@ curl -X POST http://localhost:8000/plans/1/gate \
 | POST | `/plans` | 提交并生成方案，成功 201，失败 422（结构化原因） |
 | POST | `/plans/{id}/simulate` | 约束变更影响模拟（不落库）：新波次、波次增减、逐服务新旧波次、受影响服务 |
 | POST | `/plans/{id}/gate` | 执行门禁（只读）：上报已完成/失败服务，返回最早可执行波次、可执行与阻塞服务及每项可定位原因；输入冲突统一 422 |
+| POST | `/plans/{id}/rollback-preview` | 回滚预览（只读）：上报当前已上线服务，返回下游优先、满足并发与故障域约束的最少回滚波次；上线集合违反依赖闭包时 422 并定位缺失前置 |
 | GET | `/plans?limit=50&offset=0` | 方案列表（按 id 倒序分页） |
 | GET | `/plans/{id}` | 查询单个方案（含完整波次与原始约束） |
 | DELETE | `/plans/{id}` | 删除方案，成功 200，不存在 404 |
@@ -342,9 +430,10 @@ app/
   graph.py      # 依赖图：环检测（Tarjan SCC）、关键路径
   planner.py    # CP-SAT 建模、两阶段求解、变更模拟、不可行诊断
   gate.py       # 执行门禁：逐波可执行判定、失败递归传播、进度一致性校验
+  rollback.py   # 回滚预览：上线集合依赖闭包校验、反向依赖的最少回滚波次
   db.py         # SQLite 初始化与 CRUD
   main.py       # FastAPI 路由、启动建表、异常处理
-tests/          # 端到端测试（规划/错误定位/CRUD/模拟/门禁/确定性）
+tests/          # 端到端测试（规划/错误定位/CRUD/模拟/门禁/回滚/确定性）
 Dockerfile
 docker-compose.yml
 requirements.txt

@@ -814,3 +814,240 @@ def test_gate_is_deterministic(client):
         for _ in range(3)
     ]
     assert responses[0] == responses[1] == responses[2]
+
+
+# ---------------------------------------------------------------------------
+# POST /plans/{id}/rollback-preview
+# ---------------------------------------------------------------------------
+
+
+def test_rollback_reverses_release_order(client):
+    # Release plan: [[a], [b, c], [d]]; a full rollback is the mirror.
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/rollback-preview",
+        json={"live_services": ["a", "b", "c", "d"]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["plan_id"] == plan["id"]
+    assert body["live_services"] == ["a", "b", "c", "d"]
+    assert body["wave_count"] == 3
+    assert [w["index"] for w in body["waves"]] == [1, 2, 3]
+    assert [w["services"] for w in body["waves"]] == [["d"], ["b", "c"], ["a"]]
+    assert body["max_concurrency"] == plan["max_concurrency"]
+    assert body["optimal"] is True
+
+
+def test_rollback_downstream_always_in_an_earlier_wave(client):
+    plan = _create_plan(client)
+    # Live set {a, b}: b depends on a, so b comes down first.
+    r = client.post(
+        f"/plans/{plan['id']}/rollback-preview", json={"live_services": ["a", "b"]}
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["live_services"] == ["a", "b"]
+    assert [w["services"] for w in body["waves"]] == [["b"], ["a"]]
+    wave_of = {s: w["index"] for w in body["waves"] for s in w["services"]}
+    assert wave_of["b"] < wave_of["a"]
+
+
+def test_rollback_only_covers_live_services(client):
+    plan = _create_plan(client)
+    # b and c are live without d (their downstream): they roll back together;
+    # d is absent from every wave.
+    r = client.post(
+        f"/plans/{plan['id']}/rollback-preview",
+        json={"live_services": ["a", "b", "c"]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert [w["services"] for w in body["waves"]] == [["b", "c"], ["a"]]
+    covered = {s for w in body["waves"] for s in w["services"]}
+    assert covered == {"a", "b", "c"}
+
+
+def test_rollback_respects_concurrency_cap(client):
+    # Four independent services with cap 2 need ceil(4/2) = 2 rollback waves.
+    plan = _create_plan(
+        client, {"services": ["a", "b", "c", "d"], "max_concurrency": 2}
+    )
+    r = client.post(
+        f"/plans/{plan['id']}/rollback-preview",
+        json={"live_services": ["a", "b", "c", "d"]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["wave_count"] == 2
+    assert all(len(w["services"]) <= 2 for w in body["waves"])
+
+
+def test_rollback_respects_fault_domain_anti_affinity(client):
+    plan = _create_plan(
+        client,
+        {
+            "services": ["a", "b", "c"],
+            "max_concurrency": 3,
+            "fault_domains": [{"domain": "z", "services": ["a", "b", "c"]}],
+        },
+    )
+    r = client.post(
+        f"/plans/{plan['id']}/rollback-preview",
+        json={"live_services": ["a", "b", "c"]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["wave_count"] == 3
+    placement = {s: w["index"] for w in body["waves"] for s in w["services"]}
+    assert len({placement["a"], placement["b"], placement["c"]}) == 3
+
+
+def test_rollback_fault_domain_applies_only_to_live_members(client):
+    plan = _create_plan(
+        client,
+        {
+            "services": ["a", "b", "c"],
+            "max_concurrency": 3,
+            "fault_domains": [{"domain": "z", "services": ["a", "b", "c"]}],
+        },
+    )
+    # Only a is live: the non-live clique members cannot force extra waves.
+    r = client.post(
+        f"/plans/{plan['id']}/rollback-preview", json={"live_services": ["a"]}
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["wave_count"] == 1
+    assert body["waves"] == [{"index": 1, "services": ["a"]}]
+
+
+def test_rollback_empty_live_set_has_zero_waves(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/rollback-preview", json={"live_services": []}
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["live_services"] == []
+    assert body["waves"] == []
+    assert body["wave_count"] == 0
+    assert body["optimal"] is True
+
+
+def test_rollback_closure_violation_is_localized(client):
+    # d live while its prerequisites b and c are not: each missing
+    # prerequisite gets its own issue.
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/rollback-preview", json={"live_services": ["d"]}
+    )
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"] == "planning_failed"
+    issues = body["issues"]
+    assert {i["code"] for i in issues} == {"rollback_closure_violation"}
+    by_missing = {i["context"]["missing_prerequisite"]: i for i in issues}
+    assert set(by_missing) == {"b", "c"}
+    for issue in issues:
+        assert issue["constraint"] == "live_services"
+        assert issue["related_services"] == ["d"]
+        assert issue["context"]["live_service"] == "d"
+
+
+def test_rollback_closure_holds_when_chain_is_fully_live(client):
+    plan = _create_plan(client)
+    # d with the full prerequisite chain live is fine.
+    r = client.post(
+        f"/plans/{plan['id']}/rollback-preview",
+        json={"live_services": ["a", "b", "c", "d"]},
+    )
+    assert r.status_code == 200
+    assert r.json()["wave_count"] == 3
+
+
+def test_rollback_unknown_service_is_422(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/rollback-preview", json={"live_services": ["ghost"]}
+    )
+    assert r.status_code == 422
+    issue = r.json()["issues"][0]
+    assert issue["code"] == "unknown_service"
+    assert issue["constraint"] == "live_services"
+    assert issue["service"] == "ghost"
+
+
+def test_rollback_duplicate_service_is_422(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/rollback-preview",
+        json={"live_services": ["a", "a"]},
+    )
+    assert r.status_code == 422
+    issue = r.json()["issues"][0]
+    assert issue["code"] == "duplicate_service"
+    assert issue["constraint"] == "live_services"
+    assert issue["service"] == "a"
+
+
+def test_rollback_missing_plan_is_404(client):
+    r = client.post(
+        "/plans/9999/rollback-preview", json={"live_services": ["a"]}
+    )
+    assert r.status_code == 404
+    assert r.json()["error"] == "not_found"
+
+
+def test_rollback_blank_service_id_is_validation_error(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/rollback-preview", json={"live_services": ["  "]}
+    )
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"] == "validation_error"
+    assert body["issues"][0]["code"] == "invalid_request_field"
+    assert body["issues"][0]["constraint"] == "live_services"
+
+
+def test_rollback_is_not_persisted(client):
+    plan = _create_plan(client)
+    before = client.get("/plans").json()["total"]
+    r = client.post(
+        f"/plans/{plan['id']}/rollback-preview",
+        json={"live_services": ["a", "b", "c", "d"]},
+    )
+    assert r.status_code == 200
+    assert client.get("/plans").json()["total"] == before
+    fetched = client.get(f"/plans/{plan['id']}").json()
+    assert fetched["waves"] == plan["waves"]
+    assert fetched["wave_count"] == plan["wave_count"]
+
+
+def test_rollback_is_deterministic(client):
+    plan = _create_plan(
+        client,
+        {
+            "services": ["a", "b", "c", "d", "e"],
+            "dependencies": [
+                {"service": "b", "depends_on": "a"},
+                {"service": "c", "depends_on": "a"},
+            ],
+            "max_concurrency": 2,
+            "fault_domains": [{"domain": "z", "services": ["a", "d"]}],
+        },
+    )
+    payload = {"live_services": ["e", "c", "a", "b", "d"]}
+    responses = [
+        client.post(f"/plans/{plan['id']}/rollback-preview", json=payload).json()
+        for _ in range(3)
+    ]
+    assert responses[0] == responses[1] == responses[2]
+    # Input ordering must not change the result either.
+    shuffled = client.post(
+        f"/plans/{plan['id']}/rollback-preview",
+        json={"live_services": ["a", "b", "c", "d", "e"]},
+    ).json()
+    assert shuffled == responses[0]
+    assert shuffled["live_services"] == ["a", "b", "c", "d", "e"]
