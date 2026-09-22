@@ -304,6 +304,29 @@ def _to_output(result: _SolveResult) -> PlanOutput:
     return PlanOutput(waves=ordered, wave_count=len(ordered), optimal=result.optimal)
 
 
+def schedule_waves(
+    services: list[str],
+    edges: list[tuple[str, str]],
+    fault_cliques: list[list[str]],
+    concurrency: int,
+    settings: Settings,
+) -> PlanOutput:
+    """Minimum-wave schedule for an already-validated DAG (no window cap).
+
+    Shared by rollback previews, which solve a restricted, edge-reversed
+    instance of the same wave model. An empty service set yields zero waves.
+    """
+    if not services:
+        return PlanOutput(waves=[], wave_count=0, optimal=True)
+    result = _solve(
+        services, edges, fault_cliques, len(services), concurrency, settings
+    )
+    if not result.feasible:
+        # Defensive: with horizon == n, waves of size 1 always work for DAGs.
+        raise RuntimeError("Unexpected solver infeasibility without a wave window cap")
+    return _to_output(result)
+
+
 # ---------------------------------------------------------------------------
 # Infeasibility diagnostics
 # ---------------------------------------------------------------------------

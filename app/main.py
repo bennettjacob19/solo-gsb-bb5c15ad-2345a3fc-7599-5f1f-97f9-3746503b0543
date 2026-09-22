@@ -14,6 +14,7 @@ from .config import Settings, load_settings
 from .errors import PlanningError
 from .gate import evaluate_gate
 from .planner import plan_release, simulate_plan
+from .rollback import preview_rollback
 from .schemas import (
     ErrorBody,
     GateBlockedItem,
@@ -28,6 +29,8 @@ from .schemas import (
     PlanSimulate,
     PlanSimulation,
     PlanSummary,
+    RollbackPreview,
+    RollbackPreviewRequest,
     ServiceWaveChange,
     Wave,
 )
@@ -43,13 +46,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Release Wave Planning API",
-    version="1.2.0",
+    version="1.3.0",
     description=(
         "Compute the minimum number of ordered release waves for a service "
         "dependency graph under per-wave concurrency caps and fault-domain "
         "anti-affinity constraints (OR-Tools CP-SAT), simulate the "
-        "impact of constraint changes on a stored plan, and gate execution "
-        "of a rollout against completed and failed services."
+        "impact of constraint changes on a stored plan, gate execution "
+        "of a rollout against completed and failed services, and preview "
+        "minimum rollback waves for the currently deployed services."
     ),
     lifespan=lifespan,
 )
@@ -87,6 +91,7 @@ async def request_validation_handler(
             "fault_domains",
             "completed_services",
             "failed_services",
+            "deployed_services",
         ):
             service = loc[-1] if loc[-1].isidentifier() or "-" in loc[-1] else None
         issues.append(
@@ -362,4 +367,52 @@ def gate_plan_execution(
             )
             for wave in output.waves
         ],
+    )
+
+
+@app.post(
+    "/plans/{plan_id}/rollback-preview",
+    response_model=RollbackPreview,
+    tags=["plans"],
+    responses={404: {"model": ErrorBody}, 422: {"model": ErrorBody}},
+)
+def preview_plan_rollback(
+    plan_id: int,
+    payload: RollbackPreviewRequest,
+    conn: sqlite3.Connection = Depends(db.get_db),
+) -> RollbackPreview:
+    """Preview minimum rollback waves for the currently deployed services.
+
+    Only the services reported as deployed take part in the preview; the set
+    must be dependency-closed or a 422 naming the missing prerequisite(s) is
+    returned. Each service rolls back after every deployed service that
+    depends on it, while the stored per-wave concurrency cap and
+    fault-domain anti-affinity still apply. The stored plan is read but never
+    modified.
+    """
+    row = db.fetch_plan(conn, plan_id)
+    if row is None:
+        return _plan_not_found(plan_id)  # type: ignore[return-value]
+
+    stored = json.loads(row["result_json"])
+    services = list(stored["services"])
+    edges = [(d["service"], d["depends_on"]) for d in stored["dependencies"]]
+    domains = stored["fault_domains"]
+    concurrency = stored["max_concurrency"]
+
+    output = preview_rollback(
+        services, edges, domains, concurrency, payload, app.state.settings
+    )
+
+    return RollbackPreview(
+        plan_id=row["id"],
+        name=row["name"],
+        deployed_services=output.live,
+        waves=[
+            Wave(index=i + 1, services=members)
+            for i, members in enumerate(output.waves)
+        ],
+        wave_count=output.wave_count,
+        max_concurrency=concurrency,
+        optimal=output.optimal,
     )

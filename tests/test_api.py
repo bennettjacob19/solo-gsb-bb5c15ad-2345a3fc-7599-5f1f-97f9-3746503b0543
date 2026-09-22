@@ -814,3 +814,323 @@ def test_gate_is_deterministic(client):
         for _ in range(3)
     ]
     assert responses[0] == responses[1] == responses[2]
+
+
+# ---------------------------------------------------------------------------
+# POST /plans/{id}/rollback-preview
+# ---------------------------------------------------------------------------
+
+
+def test_rollback_full_plan_reverses_release_order(client):
+    # Stored release: [[a], [b, c], [d]] (b, c depend on a; d on b and c).
+    # Rollback must be the reverse order: [[d], [b, c], [a]].
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/rollback-preview",
+        json={"deployed_services": ["a", "b", "c", "d"]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["plan_id"] == plan["id"]
+    assert body["deployed_services"] == ["a", "b", "c", "d"]
+    assert body["wave_count"] == 3
+    assert [w["services"] for w in body["waves"]] == [["d"], ["b", "c"], ["a"]]
+    assert [w["index"] for w in body["waves"]] == [1, 2, 3]
+    assert body["max_concurrency"] == plan["max_concurrency"]
+    assert body["optimal"] is True
+
+
+def test_rollback_service_waits_for_live_downstream(client):
+    # Release chain [a] -> [b] -> [c] (c depends on b, b on a) with cap 1:
+    # a cannot roll back until b is gone, b cannot until c is gone.
+    payload = {
+        "services": ["a", "b", "c"],
+        "dependencies": [
+            {"service": "b", "depends_on": "a"},
+            {"service": "c", "depends_on": "b"},
+        ],
+        "max_concurrency": 1,
+    }
+    plan = _create_plan(client, payload)
+    r = client.post(
+        f"/plans/{plan['id']}/rollback-preview",
+        json={"deployed_services": ["a", "b", "c"]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["wave_count"] == 3
+    assert [w["services"] for w in body["waves"]] == [["c"], ["b"], ["a"]]
+
+
+def test_rollback_respects_concurrency_cap(client):
+    # Four independent services, cap 2: two rollback waves, canonical split.
+    plan = _create_plan(
+        client, {"services": ["a", "b", "c", "d"], "max_concurrency": 2}
+    )
+    r = client.post(
+        f"/plans/{plan['id']}/rollback-preview",
+        json={"deployed_services": ["a", "b", "c", "d"]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["wave_count"] == 2
+    assert all(len(w["services"]) <= 2 for w in body["waves"])
+    assert [w["services"] for w in body["waves"]] == [["a", "b"], ["c", "d"]]
+
+
+def test_rollback_respects_fault_domain_anti_affinity(client):
+    payload = {
+        "services": ["a", "b", "c"],
+        "dependencies": [],
+        "max_concurrency": 3,
+        "fault_domains": [{"domain": "az-1", "services": ["a", "b", "c"]}],
+    }
+    plan = _create_plan(client, payload)
+    r = client.post(
+        f"/plans/{plan['id']}/rollback-preview",
+        json={"deployed_services": ["a", "b", "c"]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["wave_count"] == 3
+    placement = {s: w["index"] for w in body["waves"] for s in w["services"]}
+    assert len({placement["a"], placement["b"], placement["c"]}) == 3
+
+
+def test_rollback_fault_domain_restricted_to_live_members(client):
+    # Domain az-1 spans a, b, c but only a and b are live; c never deployed,
+    # so it cannot force an extra rollback wave. The two live members still
+    # share the domain and therefore cannot share a wave.
+    payload = {
+        "services": ["a", "b", "c"],
+        "dependencies": [],
+        "max_concurrency": 3,
+        "fault_domains": [{"domain": "az-1", "services": ["a", "b", "c"]}],
+    }
+    plan = _create_plan(client, payload)
+    r = client.post(
+        f"/plans/{plan['id']}/rollback-preview",
+        json={"deployed_services": ["a", "b"]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["wave_count"] == 2
+    assert [w["services"] for w in body["waves"]] == [["a"], ["b"]]
+
+    # With just one live member, the clipped clique has no effect.
+    r = client.post(
+        f"/plans/{plan['id']}/rollback-preview",
+        json={"deployed_services": ["a"]},
+    )
+    body = r.json()
+    assert body["wave_count"] == 1
+
+
+def test_rollback_combined_cap_and_fault_domain(client):
+    # README scenario, fully live: release order is
+    # [db] -> [auth] -> [api] -> [cache, web]; rollback is its reverse. The
+    # chain web -> api -> auth -> db needs 4 waves; cache (same fault domain
+    # as db, cap 2) settles canonically in wave 3 with auth.
+    payload = {
+        "name": "payment-platform",
+        "services": ["web", "api", "auth", "db", "cache"],
+        "dependencies": [
+            {"service": "web", "depends_on": "api"},
+            {"service": "api", "depends_on": "auth"},
+            {"service": "api", "depends_on": "db"},
+            {"service": "auth", "depends_on": "db"},
+        ],
+        "max_concurrency": 2,
+        "fault_domains": [{"domain": "az-a", "services": ["db", "cache"]}],
+    }
+    plan = _create_plan(client, payload)
+    r = client.post(
+        f"/plans/{plan['id']}/rollback-preview",
+        json={"deployed_services": ["web", "api", "auth", "db", "cache"]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["wave_count"] == 4
+    assert [w["services"] for w in body["waves"]] == [
+        ["web"],
+        ["api"],
+        ["auth", "cache"],
+        ["db"],
+    ]
+
+
+def test_rollback_only_live_services_take_part(client):
+    # BASE: [[a], [b, c], [d]]; d was never deployed, so only a, b, c are
+    # live. The induced subgraph rolls back as [[b, c], [a]]; d is absent.
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/rollback-preview",
+        json={"deployed_services": ["a", "b", "c"]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["deployed_services"] == ["a", "b", "c"]
+    assert body["wave_count"] == 2
+    assert [w["services"] for w in body["waves"]] == [["b", "c"], ["a"]]
+
+
+def test_rollback_not_deployed_downstream_does_not_block(client):
+    # Only a and b live (b depends on a); c and d were never deployed. The
+    # absent downstream d must not delay b's rollback: [[b], [a]].
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/rollback-preview",
+        json={"deployed_services": ["a", "b"]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["wave_count"] == 2
+    assert [w["services"] for w in body["waves"]] == [["b"], ["a"]]
+
+
+def test_rollback_single_service(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/rollback-preview",
+        json={"deployed_services": ["a"]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["wave_count"] == 1
+    assert [w["services"] for w in body["waves"]] == [["a"]]
+
+
+def test_rollback_empty_live_set_is_zero_waves(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/rollback-preview",
+        json={"deployed_services": []},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["wave_count"] == 0
+    assert body["waves"] == []
+    assert body["deployed_services"] == []
+    assert body["optimal"] is True
+
+
+def test_rollback_closure_violation_names_missing_prerequisites(client):
+    # b and c live without their prerequisite a: both issues are reported,
+    # each localizable to the missing prerequisite.
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/rollback-preview",
+        json={"deployed_services": ["b", "c"]},
+    )
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"] == "planning_failed"
+    issues = body["issues"]
+    assert len(issues) == 2
+    assert {i["code"] for i in issues} == {"rollback_prerequisite_not_deployed"}
+    by_service = {i["service"]: i for i in issues}
+    assert set(by_service) == {"b", "c"}
+    for issue in by_service.values():
+        assert issue["constraint"] == "deployed_services"
+        assert issue["related_services"] == ["a"]
+        assert issue["context"]["missing_prerequisites"] == ["a"]
+
+
+def test_rollback_closure_violation_multiple_missing_prerequisites(client):
+    # d alone is not a closed set: it is missing both b and c.
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/rollback-preview",
+        json={"deployed_services": ["d"]},
+    )
+    assert r.status_code == 422
+    issue = r.json()["issues"][0]
+    assert issue["code"] == "rollback_prerequisite_not_deployed"
+    assert issue["service"] == "d"
+    assert issue["related_services"] == ["b", "c"]
+    assert issue["context"]["missing_prerequisites"] == ["b", "c"]
+
+
+def test_rollback_unknown_service_is_422(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/rollback-preview",
+        json={"deployed_services": ["a", "ghost"]},
+    )
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"] == "planning_failed"
+    issue = body["issues"][0]
+    assert issue["code"] == "unknown_service"
+    assert issue["constraint"] == "deployed_services"
+    assert issue["service"] == "ghost"
+
+
+def test_rollback_duplicate_service_is_422(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/rollback-preview",
+        json={"deployed_services": ["a", "a", "b"]},
+    )
+    assert r.status_code == 422
+    issue = r.json()["issues"][0]
+    assert issue["code"] == "duplicate_service"
+    assert issue["constraint"] == "deployed_services"
+    assert issue["service"] == "a"
+
+
+def test_rollback_blank_service_id_is_validation_error(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/rollback-preview",
+        json={"deployed_services": ["  "]},
+    )
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"] == "validation_error"
+    assert body["issues"][0]["code"] == "invalid_request_field"
+    assert body["issues"][0]["constraint"] == "deployed_services"
+
+
+def test_rollback_missing_plan_is_404(client):
+    r = client.post(
+        "/plans/9999/rollback-preview", json={"deployed_services": ["a"]}
+    )
+    assert r.status_code == 404
+    assert r.json()["error"] == "not_found"
+
+
+def test_rollback_does_not_modify_stored_plan(client):
+    plan = _create_plan(client)
+    payload = {"deployed_services": ["a", "b"]}
+    r = client.post(f"/plans/{plan['id']}/rollback-preview", json=payload)
+    assert r.status_code == 200
+
+    # A closure-violating request must not modify anything either.
+    bad = client.post(
+        f"/plans/{plan['id']}/rollback-preview",
+        json={"deployed_services": ["d"]},
+    )
+    assert bad.status_code == 422
+
+    fetched = client.get(f"/plans/{plan['id']}").json()
+    assert fetched["waves"] == plan["waves"]
+    assert fetched["wave_count"] == plan["wave_count"]
+    assert client.get("/plans").json()["total"] == 1
+
+
+def test_rollback_is_deterministic_and_input_order_stable(client):
+    plan = _create_plan(client)
+    responses = [
+        client.post(
+            f"/plans/{plan['id']}/rollback-preview",
+            json={"deployed_services": order},
+        ).json()
+        for order in (
+            ["d", "c", "b", "a"],
+            ["a", "b", "c", "d"],
+            ["b", "a", "d", "c"],
+        )
+    ]
+    assert responses[0] == responses[1] == responses[2]
+    assert responses[0]["deployed_services"] == ["a", "b", "c", "d"]

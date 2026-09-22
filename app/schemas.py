@@ -136,6 +136,32 @@ class GateRequest(BaseModel):
         return cleaned
 
 
+class RollbackPreviewRequest(BaseModel):
+    """Services currently live, for which rollback waves are to be previewed.
+
+    The set must be dependency-closed: every prerequisite of a deployed
+    service must be deployed as well, otherwise the response is 422 with the
+    missing prerequisites named. The stored plan is never modified.
+    """
+
+    deployed_services: list[str] = Field(
+        ...,
+        description=(
+            "Services currently live (rolled out). Only these services take "
+            "part in the rollback preview; the set must be dependency-closed. "
+            "An empty list previews zero rollback waves"
+        ),
+    )
+
+    @field_validator("deployed_services")
+    @classmethod
+    def _strip_service_ids(cls, values: list[str]) -> list[str]:
+        cleaned = [s.strip() for s in values]
+        if any(not s for s in cleaned):
+            raise ValueError("service id must not be blank")
+        return cleaned
+
+
 # ---- Response models -------------------------------------------------------
 
 
@@ -272,6 +298,28 @@ class GateResult(BaseModel):
     failed_services: list[str] = Field(..., description="Reported failures, sorted")
     waves: list[GateWaveStatus] = Field(
         ..., description="Executable/blocked/completed/failed split for every stored wave"
+    )
+
+
+class RollbackPreview(BaseModel):
+    """Outcome of a read-only rollback-wave preview; never persisted."""
+
+    plan_id: int
+    name: str | None
+    deployed_services: list[str] = Field(
+        ..., description="Echoed live services, sorted and de-duplicated"
+    )
+    waves: list[Wave] = Field(
+        ...,
+        description="Rollback waves (1-based); every service rolls back only "
+        "after all live services that depend on it",
+    )
+    wave_count: int = Field(..., description="Total number of rollback waves")
+    max_concurrency: int = Field(
+        ..., description="Per-wave cap inherited from the stored plan"
+    )
+    optimal: bool = Field(
+        ..., description="True when the minimum wave count is proven by the solver"
     )
 
 
